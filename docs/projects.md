@@ -27,6 +27,141 @@ an allowlist for the sample. Rendered Compose config may contain environment sec
 it is stored privately at `<git-common-dir>/devkit/runs/<preview>/compose.json`.
 These are per-preview execution artifacts for restart/cleanup, not a task registry.
 
+## Virtual machines
+
+Use the same `project` slug as your Docker previews, and list the VMs that belong
+to it in `devkit.json`:
+
+```json
+{
+  "project": "swiftconfig",
+  "vms": [
+    {"name": "native-ubuntu22-task30"},
+    {"uuid": "f845843c-ec18-4c42-8298-d8aec5c22286"}
+  ]
+}
+```
+
+Merge `vms` into your existing recipe; keep its Compose settings and hooks. A
+VM-only project can use just `project` and `vms`. Each mapping has exactly one
+`name` or `uuid`, with at most 128 mappings per recipe. Names are exact and
+case-sensitive (no prefix/glob matching); UUIDs are case-insensitive. QEMU gets
+its identity from `-name` / `-uuid`; libvirt provides its domain name and UUID.
+Find these with `devkit vms --json`. Existing launch scripts need no changes
+when they already give their guests stable names. UUIDs are preferable when
+names may repeat or change.
+
+UUID mappings take precedence over name mappings. If several active VMs share
+a mapped identifier, or different projects claim the same VM at the same priority,
+those VMs stay in **Other VMs** with an explanation. The same project can repeat
+its mapping across worktrees without causing a conflict. Grouping is informational;
+it does not grant access or change VM ownership, lifecycle or SSH authentication.
+
+Recipe discovery uses Docker preview worktree labels, the harness's worktree glob,
+the current CLI directory, and readable QEMU working directories. For nested
+working directories it reads the nearest recipe. A working directory only helps
+find a recipe: the VM still needs an explicit mapping. No disk-path inference or
+recursive home-directory scan is performed.
+
+For a VM-only project (particularly libvirt), add its directory to the host's
+`~/.config/devkit/config.json` so the dashboard can find it independently of Docker:
+
+```json
+"vm_projects": ["/home/mads/Work/SwiftConfig", "/home/mads/Work/PlayWarden"]
+```
+
+These must be absolute paths or start with `~/`, with at most 128 directories.
+Docker discovery is bounded and optional; errors leave other sources usable.
+At most 128 unique recipes are read per inventory refresh. Recipes can use the
+legacy `devbox.json` name. Configuration edits take effect on the next refresh
+(the inventory cache lasts five seconds); there is no VM or dashboard restart.
+Neither project discovery paths nor disk paths are returned in VM API metadata.
+
+### Start, stop and restart VMs
+
+Mappings are read-only by default. To enable lifecycle control, add `control` to
+one unique VM definition. For standalone QEMU or a native engine, wrap your
+existing launcher with start and stop commands:
+
+```json
+{
+  "project": "swiftconfig",
+  "vms": [{
+    "name": "native-ubuntu22-task30",
+    "control": {
+      "start": "./scripts/native-vm start",
+      "stop": "./scripts/native-vm stop",
+      "timeout_seconds": 120
+    }
+  }]
+}
+```
+
+The commands above illustrate a project adapter you supply; devkit does not ship
+`native-vm` or change SwiftConfig's engine. Commands run as the devkit user with
+`sh -eu -c` in that recipe's directory, like project hooks. They receive
+`DEVKIT_PROJECT`, `DEVKIT_VM_NAME`, `DEVKIT_VM_UUID` (empty when not selected), and
+the corresponding `DEVBOX_*` variables. Both commands are required. The launcher
+must give the guest that exact stable QEMU `-name` or `-uuid`, detach it (for
+example QEMU `-daemonize`), redirect its standard streams and return. The stop
+adapter must request graceful shutdown of only that guest, preserve its disks,
+and return. Use your engine's existing shutdown operation; do not use broad
+process-name killing. These commands are trusted project code: devkit cannot
+make an arbitrary script safe or prevent it from deleting files.
+
+For an already defined persistent libvirt guest, use its UUID and local connection URI:
+
+```json
+{
+  "uuid": "f845843c-ec18-4c42-8298-d8aec5c22286",
+  "control": {"libvirt_uri": "qemu:///session", "timeout_seconds": 120}
+}
+```
+
+`qemu:///system` is also supported with the devkit user's existing libvirt
+permissions. No sudo, remote libvirt URI, VM provisioning or XML changes are
+performed. Do not combine `libvirt_uri` with shell commands. Devkit uses native
+`virsh start` / `shutdown`, and polls state because shutdown is asynchronous.
+See the [libvirt command reference](https://www.libvirt.org/manpages/virsh.html).
+
+```sh
+devkit up --vm native-ubuntu22-task30      # start via the configured launcher
+devkit start --vm native-ubuntu22-task30   # equivalent; already running is a no-op
+devkit stop --vm native-ubuntu22-task30    # wait for shutdown; retain disks
+devkit restart --vm native-ubuntu22-task30 # stop, wait, then start
+devkit vms --json                         # includes stopped managed guests/control_id
+```
+
+Names and UUIDs resolve within the current project's recipe when present;
+otherwise they must uniquely identify a discovered definition. The opaque
+`control_id` shown by `vms` works anywhere and is what dashboard buttons use.
+Use `vm_projects` above so the dashboard can still discover a VM's recipe after
+its last guest stops. Settings are read again when an action runs; removing
+`control` revokes it. No VM actions are implicit: `devkit up` without `--vm` is
+an alias for the existing Docker `live` command. Docker `start`/`stop` keep their
+existing meanings, and `destroy --vm` is unsupported.
+
+Each start or stop step has a timeout (default 120 seconds, maximum 600), including
+its command and state polling. A successful start means the process/domain is
+running; it does not promise the guest OS, SSH or applications are ready. A restart
+never launches the replacement until stop succeeds. A timeout reports failure
+without escalating to a forced shutdown of a detached guest. Timed-out launcher
+process groups are cancelled, including their shell children; a guest incorrectly
+left in that group may be terminated too. Launchers must detach guests before
+waiting for readiness. Check guest state before retrying. Paused guests must first
+be resumed through their existing manager before a restart. Stop is available to
+request graceful shutdown, which a paused guest may not be able to complete.
+
+Only one devkit VM lifecycle operation runs at a time on a host, across both CLI
+and dashboard. Conflicting definitions, duplicate live identities, provider
+mismatches and incomplete process visibility disable control rather than guessing.
+Unlike display-only grouping, duplicate control claims across worktrees are
+ambiguous even with the same project slug: put control in one discovered recipe
+and give worktree-specific guests unique identities. At most 128 discovered
+control definitions are supported. Unavailable/missing libvirt domains remain
+unavailable, not stopped. Inventory and private connection discovery still work
+for guests without lifecycle configuration.
+
 ## Media ports
 
 WebRTC and other media protocols cannot travel through an HTTP preview route.
