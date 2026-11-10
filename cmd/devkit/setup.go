@@ -22,6 +22,7 @@ import (
 type setupOptions struct {
 	yes                    bool // take every default and fail where there is none
 	domain, email, harness string
+	secretsProvider        string
 }
 
 // prompter asks questions on stderr and reads answers from stdin.
@@ -199,6 +200,9 @@ func setup(opts setupOptions) error {
 	}
 	proxy.Listen = strings.Fields(strings.ReplaceAll(listen, ",", " "))
 
+	if err := setupSecretsProvider(p, opts.secretsProvider, raw); err != nil {
+		return err
+	}
 	step("Credentials")
 	if proxy.DNSEnv, err = askDNSCredentials(p, proxy.DNSProvider, proxy.DNSEnv, dom); err != nil {
 		return err
@@ -239,6 +243,14 @@ func setup(opts setupOptions) error {
 		step("T3 Code")
 		if err := ensureT3(p, dom); err != nil {
 			return err
+		}
+	}
+	if vault, e := loadVaultConfig(); e != nil {
+		return e
+	} else if vault.Provider == "openbao" {
+		step("Agent skills")
+		if e = setupAgentSkills(); e != nil {
+			return e
 		}
 	}
 	happened("setup", "", "*."+dom)
@@ -394,6 +406,13 @@ func askDNSCredentials(p *prompter, provider string, current map[string]secretSo
 			return nil, fail("%q is not an environment variable name.", key)
 		}
 		if source, ok := current[key]; ok {
+			vc, ve := loadVaultConfig()
+			if ve != nil {
+				return nil, ve
+			}
+			if vc.Provider == "openbao" && source.OpenBao == "" {
+				return nil, fail("Existing local DNS credentials need an explicit verified import before managed setup")
+			}
 			if _, err := source.read(); err == nil {
 				keep, err := p.confirm(fmt.Sprintf("%s comes from %s. Keep it?", key, source), true)
 				if err != nil {
@@ -406,6 +425,28 @@ func askDNSCredentials(p *prompter, provider string, current map[string]secretSo
 			} else {
 				fmt.Fprintf(stdout, "%s from %s does not work: %v\n", key, source, err)
 			}
+		}
+		vaultCfg, err := loadVaultConfig()
+		if err != nil {
+			return nil, err
+		}
+		if vaultCfg.Provider == "openbao" {
+			if p.yes {
+				return nil, fail("%s requires secure input before setup can continue", key)
+			}
+			value, err := readSecret(key+" (saved directly to OpenBao): ", p.in)
+			if err != nil {
+				return nil, err
+			}
+			if value == "" {
+				return nil, fail("Credential cannot be empty")
+			}
+			source, err := setIntegration("dns", key, value)
+			if err != nil {
+				return nil, err
+			}
+			result[key] = source
+			continue
 		}
 		file := filepath.Join(configDir(), strings.ToLower(strings.ReplaceAll(key, "_", "-")))
 		if key == "CF_DNS_API_TOKEN" {
@@ -535,19 +576,30 @@ func startProxyWithCertificate(raw map[string]any, proxy *proxyConfig, dom, ip s
 		if err := setupProxy(); err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "Waiting for a %s certificate for *.%s (up to %s)...\n", want, dom, certificateTimeout)
-		deadline := time.Now().Add(certificateTimeout)
-		for {
-			if cert, verr, err := servedCertificate(ip, host); err == nil && accept(cert, verr) {
-				fmt.Fprintf(stdout, "Got it, issued by %s, valid until %s.\n", cert.Issuer.CommonName, cert.NotAfter.Format("2 Jan 2006"))
-				return nil
-			}
-			if time.Now().After(deadline) {
-				return fail("No %s certificate after %s. See docker logs %s-traefik-1, fix the cause and run devkit setup again.",
-					want, certificateTimeout, proxyProject)
-			}
-			time.Sleep(certificatePoll)
+		cfg, err := loadHostConfig()
+		if err != nil {
+			return err
 		}
+		hosts := []string{host}
+		if vaultEnabled(cfg) {
+			hosts = append(hosts, "vault.devkit."+dom)
+		}
+		fmt.Fprintf(stdout, "Waiting for %s certificates for %s (up to %s)...\n", want, strings.Join(hosts, ", "), certificateTimeout)
+		deadline := time.Now().Add(certificateTimeout)
+		for _, name := range hosts {
+			for {
+				if cert, verr, err := servedCertificate(ip, name); err == nil && accept(cert, verr) {
+					fmt.Fprintf(stdout, "%s: issued by %s, valid until %s.\n", name, cert.Issuer.CommonName, cert.NotAfter.Format("2 Jan 2006"))
+					break
+				}
+				if time.Now().After(deadline) {
+					return fail("No %s certificate for %s after %s. See docker logs %s-traefik-1, fix the cause and run devkit setup again.",
+						want, name, certificateTimeout, proxyProject)
+				}
+				time.Sleep(certificatePoll)
+			}
+		}
+		return nil
 	}
 	trusted := func(_ *x509.Certificate, verr error) bool { return verr == nil }
 	if cert, verr, err := servedCertificate(ip, host); err == nil && verr == nil {

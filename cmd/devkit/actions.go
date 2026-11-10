@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,27 +15,41 @@ import (
 
 // Dashboard actions run the devkit binary itself, exactly as the CLI would, as background jobs whose
 // output the page follows. Every target is checked against what exists on this host first: a preview
-// devkit manages, or a worktree of a repository devkit knows.
+// devkit manages, or a worktree of a repository devkit knows. Explicit project creation
+// instead reserves a new child of the configured projects directory.
 
 type actionRequest struct {
-	Action   string `json:"action"`
-	Preview  string `json:"preview"`
-	Worktree string `json:"worktree"`
-	Repo     string `json:"repo"`
-	Host     string `json:"host"`
-	Hours    int    `json:"hours"`
-	Confirm  string `json:"confirm"`
+	GitHubOwner  string `json:"github_owner"`
+	GitHubRepo   string `json:"github_repo"`
+	GitHubPublic bool   `json:"github_public"`
+	GitHubPush   bool   `json:"github_push"`
+	Path         string `json:"path"`
+	Expected     string `json:"expected"`
+	Content      string `json:"content"`
+	Name         string `json:"name"`
+	Remote       string `json:"remote"`
+	AgentNotes   string `json:"agent_notes"`
+	VM           string `json:"vm"`
+	Container    string `json:"container"`
+	Action       string `json:"action"`
+	Preview      string `json:"preview"`
+	Worktree     string `json:"worktree"`
+	Repo         string `json:"repo"`
+	Host         string `json:"host"`
+	Hours        int    `json:"hours"`
+	Confirm      string `json:"confirm"`
 }
 
 // plannedAction is a checked request: the devkit arguments, where to run them and what they lock.
 type plannedAction struct {
+	stdin  string
 	args   []string
 	dir    string
 	target string
 	title  string
 }
 
-// knownRepos maps each repository devkit knows (from previews and harness worktrees) to its worktrees.
+// knownRepos maps repositories from previews, project roots and harness worktrees to their checkouts.
 func knownRepos(containers []container) map[string][]worktree {
 	repos := map[string][]worktree{}
 	for _, c := range containers {
@@ -64,6 +79,25 @@ func repoDir(trees []worktree, preferred string) string {
 }
 
 func planAction(req actionRequest) (plannedAction, error) {
+	if req.Action == "document-save" {
+		return planDocumentSave(req)
+	}
+	if req.Action == "project-create" {
+		return planProjectCreate(req)
+	}
+	if req.Action == "container-start" {
+		return planContainerStart(req)
+	}
+	if req.Action == "container-stop" {
+		return planContainerStop(req)
+	}
+	if strings.HasPrefix(req.Action, "git-") {
+		return planGitAction(req)
+	}
+	if strings.HasPrefix(req.Action, "vm-") {
+		return planVMAction(req)
+	}
+
 	containers, err := dockerContainers()
 	if err != nil {
 		return plannedAction{}, err
@@ -115,9 +149,12 @@ func planAction(req actionRequest) (plannedAction, error) {
 			}
 		}
 		return p, nil
-	case "live", "review":
+	case "up", "live", "review":
 		for _, trees := range repos {
 			if _, ok := branchOf(trees, req.Worktree); ok && req.Worktree != "" {
+				if req.Action == "up" && !checkoutProject(worktree{Path: req.Worktree}, nil).Docker {
+					return plannedAction{}, fail("This checkout needs a valid live Compose recipe before launching containers.")
+				}
 				p := plannedAction{args: []string{req.Action}, dir: req.Worktree, target: "worktree " + req.Worktree,
 					title: req.Action + " " + filepath.Base(req.Worktree)}
 				if req.Action == "review" {
@@ -171,9 +208,10 @@ func (j *job) since(offset int) (string, int, bool, bool) {
 }
 
 type jobs struct {
-	mu   sync.Mutex
-	list map[string]*job
-	next int
+	after func(plannedAction)
+	mu    sync.Mutex
+	list  map[string]*job
+	next  int
 }
 
 // runAction is how a job executes; tests replace it.
@@ -184,6 +222,7 @@ var runAction = func(p plannedAction, out *job) error {
 	}
 	cmd := exec.Command(self, p.args...)
 	cmd.Dir, cmd.Stdout, cmd.Stderr = p.dir, out, out
+	cmd.Stdin = strings.NewReader(p.stdin)
 	cmd.Env = withEnv(os.Environ(), map[string]string{"DEVKIT_BY": "dashboard"})
 	return cmd.Run()
 }
@@ -209,6 +248,9 @@ func (s *jobs) start(p plannedAction) (*job, error) {
 	fmt.Fprintf(j, "$ devkit %s\n", strings.Join(p.args, " "))
 	go func() {
 		err := runAction(p, j)
+		if s.after != nil {
+			s.after(p)
+		}
 		j.mu.Lock()
 		j.Done, j.OK, j.finished = true, err == nil, time.Now()
 		j.mu.Unlock()
@@ -223,4 +265,35 @@ func (s *jobs) get(id string) *job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.list[id]
+}
+
+// VM targets are opaque server-discovered IDs, never caller-provided scripts/paths.
+func planVMAction(req actionRequest) (plannedAction, error) {
+	if strings.HasPrefix(req.VM, "live-") {
+		return planLiveVMAction(req)
+	}
+	action := strings.TrimPrefix(req.Action, "vm-")
+	if action != "start" && action != "stop" && action != "restart" {
+		return plannedAction{}, fail("Unsupported VM action.")
+	}
+	if !strings.HasPrefix(req.VM, "vm-") || len(req.VM) > 80 {
+		return plannedAction{}, fail("Use a configured VM control ID.")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	t, err := resolveVMControl(ctx, req.VM)
+	if err != nil {
+		return plannedAction{}, err
+	}
+	if t.vm.ControlID != req.VM {
+		return plannedAction{}, fail("Use a configured VM control ID.")
+	}
+	allowed := false
+	for _, a := range t.vm.Actions {
+		allowed = allowed || a == action
+	}
+	if !allowed {
+		return plannedAction{}, fail("VM state changed; refresh before acting.")
+	}
+	return plannedAction{args: []string{action, "--vm", req.VM}, dir: t.root, target: "vm lifecycle", title: action + " VM " + t.vm.Name}, nil
 }

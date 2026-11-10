@@ -15,11 +15,14 @@ import (
 // hostConfig is ~/.config/devkit/config.json: what devkit knows about this host. devkit setup
 // writes it; devkit web password adds the dashboard password.
 type hostConfig struct {
-	Name        string         `json:"name"`         // optional; the dashboard's title, the hostname by default
-	Domain      string         `json:"domain"`       // preview domain, e.g. "dev.example.com"; DEV_DOMAIN overrides it
-	TailscaleIP string         `json:"tailscale_ip"` // optional; read from tailscale ip -4 when empty
-	Harness     *harnessConfig `json:"harness"`      // the agent tool on this host, if any
-	Proxy       *proxyConfig   `json:"proxy"`        // the Traefik proxy started by devkit proxy up
+	Secrets     *vaultConfig   `json:"secrets,omitempty"`
+	ProjectsDir string         `json:"projects_dir,omitempty"` // parent of main project folders
+	VMProjects  []string       `json:"vm_projects,omitempty"`  // explicit recipe roots for VM-only projects
+	Name        string         `json:"name"`                   // optional; the dashboard's title, the hostname by default
+	Domain      string         `json:"domain"`                 // preview domain, e.g. "dev.example.com"; DEV_DOMAIN overrides it
+	TailscaleIP string         `json:"tailscale_ip"`           // optional; read from tailscale ip -4 when empty
+	Harness     *harnessConfig `json:"harness"`                // the agent tool on this host, if any
+	Proxy       *proxyConfig   `json:"proxy"`                  // the Traefik proxy started by devkit proxy up
 	Web         struct {
 		Port int `json:"port"`
 	} `json:"web"`
@@ -86,6 +89,24 @@ func loadHostConfig() (hostConfig, error) {
 			return cfg, fail("%s: %v", configPath(), err)
 		}
 	}
+	if cfg.Secrets != nil {
+		normalized, e := loadVaultConfig()
+		if e != nil {
+			return cfg, e
+		}
+		cfg.Secrets = &normalized
+	}
+	if cfg.ProjectsDir != "" && !filepath.IsAbs(expandHome(cfg.ProjectsDir)) {
+		return cfg, fail("projects_dir must be absolute or start with ~/.")
+	}
+	if len(cfg.VMProjects) > 128 {
+		return cfg, fail("vm_projects accepts at most 128 project directories.")
+	}
+	for _, root := range cfg.VMProjects {
+		if !filepath.IsAbs(expandHome(root)) {
+			return cfg, fail("vm_projects directories must be absolute or start with ~/.")
+		}
+	}
 	cfg.Domain = strings.TrimRight(strings.ToLower(cfg.Domain), ".")
 	if cfg.Web.Port == 0 {
 		cfg.Web.Port = defaultWebPort
@@ -140,6 +161,7 @@ var tailscaleIP = func() (string, error) {
 // secretSource says where a secret comes from: a private file, an environment variable or a
 // command such as "op read op://dev/cloudflare/token". Exactly one is set.
 type secretSource struct {
+	OpenBao string `json:"openbao,omitempty"`
 	File    string `json:"file,omitempty"`
 	Env     string `json:"env,omitempty"`
 	Command string `json:"command,omitempty"`
@@ -147,6 +169,8 @@ type secretSource struct {
 
 func (s secretSource) String() string {
 	switch {
+	case s.OpenBao != "":
+		return s.OpenBao
 	case s.File != "":
 		return "file " + expandHome(s.File)
 	case s.Env != "":
@@ -157,15 +181,18 @@ func (s secretSource) String() string {
 
 func (s secretSource) read() (string, error) {
 	set := 0
-	for _, v := range []string{s.File, s.Env, s.Command} {
+	for _, v := range []string{s.File, s.Env, s.Command, s.OpenBao} {
 		if v != "" {
 			set++
 		}
 	}
 	if set != 1 {
-		return "", fail("A secret needs exactly one of file, env or command.")
+		return "", fail("A secret needs exactly one of file, env, command or openbao.")
 	}
 	var value string
+	if s.OpenBao != "" {
+		return readVaultReference(s.OpenBao)
+	}
 	switch {
 	case s.File != "":
 		path := expandHome(s.File)
@@ -274,6 +301,13 @@ func loadShareConfig() (cfg shareConfig, ok bool, err error) {
 			file = filepath.Join(configDir(), "cloudflare-token")
 		}
 		cfg.Token = &secretSource{File: file}
+	}
+	provider, providerErr := loadVaultConfig()
+	if providerErr != nil {
+		return cfg, false, providerErr
+	}
+	if provider.Provider == "openbao" && cfg.Token.OpenBao == "" {
+		return cfg, false, fail("Managed sharing needs an OpenBao token reference; use vault migrate --source share")
 	}
 	if cfg.Prefix == nil {
 		prefix := "preview-"

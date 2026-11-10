@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +28,7 @@ type asset struct {
 func loadAssets() (map[string]asset, error) {
 	assets := map[string]asset{}
 	for path, file := range map[string]struct{ name, kind, cache string }{
-		"/":                     {"index.html", "text/html; charset=utf-8", "no-store"},
+		"/":                     {"dist/index.html", "text/html; charset=utf-8", "no-store"},
 		"/logo.svg":             {"logo.svg", "image/svg+xml", "max-age=3600"},
 		"/favicon.ico":          {"favicon.ico", "image/x-icon", "max-age=3600"},
 		"/apple-touch-icon.png": {"apple-touch-icon.png", "image/png", "max-age=3600"},
@@ -37,7 +40,30 @@ func loadAssets() (map[string]asset, error) {
 		// Browsers keep favicons in their own cache and may skip no-store responses.
 		assets[path] = asset{body, file.kind, file.cache}
 	}
-	return assets, nil
+	// Only compiled assets embedded at build time are published. Never serve source,
+	// package files or arbitrary filesystem paths; unknown URLs remain 404s.
+	err := fs.WalkDir(web.Files, "dist", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if _, known := assets["/"+strings.TrimPrefix(name, "dist/")]; known || name == "dist/index.html" {
+			return nil
+		}
+		kind := map[string]string{".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".woff2": "font/woff2", ".svg": "image/svg+xml"}[path.Ext(name)]
+		if kind == "" {
+			return fmt.Errorf("unsupported dashboard asset: %s", name)
+		}
+		body, err := web.Files.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		assets["/"+strings.TrimPrefix(name, "dist/")] = asset{body, kind, "public, max-age=31536000, immutable"}
+		return nil
+	})
+	return assets, err
 }
 
 func send(w http.ResponseWriter, code int, body []byte, kind, cache string) {
@@ -121,12 +147,26 @@ func newHandler() (http.Handler, error) {
 		return nil, err
 	}
 	res := newResources()
+	vms := newVMInventory()
 	go reapLoop()
 	actions := newActionHandler()
+	actions.jobs.after = func(p plannedAction) {
+		if p.target == "vm lifecycle" {
+			vms.invalidate()
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		plain := "text/plain; charset=utf-8"
 		if a, ok := assets[r.URL.Path]; ok && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 			send(w, http.StatusOK, a.body, a.kind, a.cache)
+			return
+		}
+		if r.URL.Path == "/api/secrets/v1" {
+			secretsAPIHandler(w, r)
+			return
+		}
+		if r.URL.Path == "/api/secrets" {
+			secretsWebHandler(w, r)
 			return
 		}
 		if actions.handles(r.URL.Path) {
@@ -140,6 +180,30 @@ func newHandler() (http.Handler, error) {
 		query := r.URL.Query()
 		var err error
 		switch r.URL.Path {
+		case "/api/containers":
+			var data containersData
+			if data, err = containersOverview(r.Context()); err == nil {
+				sendJSON(w, data)
+			}
+		case "/api/documents":
+			var data documentList
+			if data, err = listDocuments(query.Get("worktree")); err == nil {
+				sendJSON(w, data)
+			}
+		case "/api/document-image":
+			err = serveDocumentImage(w, r)
+		case "/api/document":
+			var data documentData
+			if data, err = readDocument(query.Get("worktree"), query.Get("path")); err == nil {
+				sendJSON(w, data)
+			}
+		case "/api/projects":
+			var data projectsData
+			if data, err = projectsOverview(); err == nil {
+				sendJSON(w, data)
+			}
+		case "/api/vms":
+			sendJSON(w, vms.snapshot(r.Context()))
 		case "/api/overview":
 			var data overviewData
 			if data, err = overview(); err == nil {
@@ -157,11 +221,50 @@ func newHandler() (http.Handler, error) {
 		case "/api/resources":
 			sendJSON(w, res.snapshot(query.Get("full") == "1"))
 		case "/api/container":
+			if target := query.Get("container"); target != "" {
+				var c container
+				if !fullContainerID.MatchString(target) {
+					err = fail("Use a full registered container ID.")
+				} else {
+					c, err = registeredContainer(r.Context(), target)
+				}
+				if err == nil {
+					sendJSON(w, containerDetailsView(c))
+				}
+				break
+			}
 			var details map[string]any
 			if details, err = containerDetails(query.Get("preview"), optional(query, "service")); err == nil {
 				sendJSON(w, details)
 			}
 		case "/api/logs":
+			if target := query.Get("container"); target != "" {
+				var c container
+				if !fullContainerID.MatchString(target) {
+					err = fail("Use a full registered container ID.")
+				} else {
+					c, err = registeredContainer(r.Context(), target)
+				}
+				if err == nil {
+					args := logsCommand(c.ID, query.Get("follow") == "1")
+					if query.Get("follow") == "1" {
+						stream(w, r, args)
+					} else {
+						ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+						cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+						cmd.WaitDelay = 250 * time.Millisecond
+						var out vmOutput
+						cmd.Stdout, cmd.Stderr = &out, &out
+						if runErr := cmd.Run(); runErr != nil {
+							err = fail("Cannot read registered container logs; refresh the inventory.")
+						} else {
+							send(w, http.StatusOK, []byte(out.String()), plain, "no-store")
+						}
+						cancel()
+					}
+				}
+				break
+			}
 			name, svc := query.Get("preview"), optional(query, "service")
 			if query.Get("follow") == "1" {
 				var id string
@@ -252,7 +355,7 @@ func (h *actionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		actionRequest
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil && r.URL.Path != "/api/logout" {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&body); err != nil && r.URL.Path != "/api/logout" {
 		sendError(w, http.StatusBadRequest, "Send JSON.")
 		return
 	}
@@ -385,6 +488,13 @@ func serve(host string, port int) error {
 	if err != nil {
 		return err
 	}
+	stopSecrets, err := startSecretSocket()
+	if err != nil {
+		return err
+	}
+	defer stopSecrets()
+	stopMaintenance := startSecretsMaintenance()
+	defer stopMaintenance()
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {

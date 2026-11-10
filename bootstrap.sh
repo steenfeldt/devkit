@@ -6,6 +6,15 @@
 # Safe to run again: each step is skipped when it is already done.
 set -eu
 
+qemu=no
+for arg in "$@"; do
+	case "$arg" in
+	--qemu) qemu=yes ;;
+	-h|--help) echo "usage: ./bootstrap.sh [--qemu]"; echo "--qemu also installs QEMU/KVM, libvirt, UEFI and TPM tools (x86_64/aarch64)."; exit 0 ;;
+	*) printf 'bootstrap: unknown argument %s\n' "$arg" >&2; exit 1 ;;
+	esac
+done
+
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'bootstrap: %s\n' "$*" >&2; exit 1; }
 
@@ -32,9 +41,9 @@ fi
 say "Base packages"
 if [ "$family" = apt ]; then
 	sudo apt-get update -qq
-	sudo apt-get install -y -qq ca-certificates curl git
+	sudo apt-get install -y -qq ca-certificates curl git age
 else
-	sudo dnf install -y -q ca-certificates curl git
+	sudo dnf install -y -q ca-certificates curl git age
 fi
 
 say "Docker Engine and Compose v2"
@@ -73,6 +82,38 @@ else
 	sudo usermod -aG docker "$user"
 	echo "added $user to the docker group"
 	relogin=yes
+fi
+
+if [ "$qemu" = yes ]; then
+	say "QEMU/KVM and libvirt (headless and graphical guests)"
+	case "$(uname -m)" in
+	x86_64) apt_qemu=qemu-system-x86 apt_firmware=ovmf rpm_firmware=edk2-ovmf ;;
+	aarch64|arm64) apt_qemu=qemu-system-arm apt_firmware=qemu-efi-aarch64 rpm_firmware=edk2-aarch64 ;;
+	*) die "--qemu supports native x86_64 and aarch64 hosts; install QEMU manually on this architecture" ;;
+	esac
+	if [ "$family" = apt ]; then
+		sudo apt-get install -y -qq "$apt_qemu" qemu-utils libvirt-daemon-system libvirt-clients "$apt_firmware" swtpm swtpm-tools
+	else
+		sudo dnf install -y -q qemu-kvm qemu-img qemu-ui-spice-core qemu-char-spice qemu-device-display-qxl libvirt-daemon-kvm libvirt-client "$rpm_firmware" swtpm swtpm-tools
+	fi
+	for group in kvm libvirt; do
+		if getent group "$group" >/dev/null && ! id -nG "$user" | tr ' ' '\n' | grep -qx "$group"; then
+			sudo usermod -aG "$group" "$user"
+			relogin=yes
+		fi
+	done
+	# Keep an existing monolithic daemon; otherwise prefer the distro's modular sockets.
+	if sudo systemctl is-active --quiet libvirtd.service || sudo systemctl is-active --quiet libvirtd.socket; then
+		echo "existing libvirtd is active"
+	elif sudo systemctl cat virtqemud.socket >/dev/null 2>&1; then
+		sudo systemctl enable --now virtqemud.socket virtqemud-ro.socket
+	else
+		sudo systemctl enable --now libvirtd.service
+	fi
+	if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+		echo "KVM is not accessible in this login. Re-login after group changes and check firmware virtualization settings."
+	fi
+	echo "QEMU display ports stay private. Install virt-viewer on your client for SPICE/VNC."
 fi
 
 say "Tailscale"
@@ -121,7 +162,7 @@ fi
 
 say "Done"
 if [ -n "$relogin" ]; then
-	echo "Log out and back in (or run 'newgrp docker') so Docker works without sudo."
+	echo "Log out and back in so the new Docker/KVM/libvirt group membership takes effect."
 fi
 if [ -z "$(git config --global user.email 2>/dev/null)" ]; then
 	echo "Git has no identity yet; commits need one:"
